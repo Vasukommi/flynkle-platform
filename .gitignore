@@ -1,0 +1,9 @@
+# Ignore sibling Git-managed services
+../flynkle-brain/
+../flynkle-api/
+
+# Standard ignores
+.env
+__pycache__/
+*.pyc
+.DS_Store
