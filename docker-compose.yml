@@ -1,0 +1,220 @@
+version: '3.9'
+
+services:
+  # --- Flynkle Brain Service ---
+  flynkle_brain:
+    build:
+      context: ../flynkle-brain 
+      dockerfile: Dockerfile
+    container_name: flynkle-brain-service 
+    ports:
+      - "8000:8000" 
+    volumes:
+      - ../flynkle-brain/app:/app/app 
+      - ../flynkle-brain/tests:/app/tests 
+    env_file:
+      - ../flynkle-brain/.env 
+    depends_on:
+      postgres: # Changed from flynkle_postgres to postgres to match your service name
+        condition: service_healthy 
+      vectorstore:
+        condition: service_started 
+      minio:
+        condition: service_healthy 
+      redis:
+        condition: service_healthy 
+      neo4j:
+        condition: service_healthy 
+    restart: always # Changed from on-failure to always for consistency if desired
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  # --- Flynkle API Gateway Service ---
+  flynkle_api:
+    build:
+      context: ../flynkle-api 
+      dockerfile: Dockerfile
+    container_name: flynkle-api-gateway
+    ports:
+      - "8050:8001" 
+    volumes:
+      - ../flynkle-api/app:/app/app 
+    env_file:
+      - ../flynkle-api/.env 
+    depends_on:
+      flynkle_brain: 
+        condition: service_healthy
+      # Add flynkle_auth dependency later when API calls auth service
+    restart: always # Changed from on-failure to always
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost:8001/"] # If this works, keep it. Otherwise, consider /api/health
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  # --- Celery Worker for Flynkle Brain ---
+  flynkle_celery_worker: 
+    build:
+      context: ../flynkle-brain 
+      dockerfile: Dockerfile
+    container_name: flynkle-brain-celery-worker
+    command: celery -A app.celery_utils.celery_app worker -l INFO -P solo
+    volumes:
+      - ../flynkle-brain/app:/app/app 
+    env_file:
+      - ../flynkle-brain/.env 
+    depends_on:
+      redis:
+        condition: service_healthy 
+      neo4j:
+        condition: service_healthy 
+      flynkle_brain: 
+        condition: service_healthy
+    restart: always
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  # --- NEW Flynkle Auth Service ---
+  flynkle_auth:
+    build:
+      context: ../flynkle-auth 
+      dockerfile: Dockerfile
+    container_name: flynkle-auth-service
+    ports:
+      - "8060:8002" 
+    volumes:
+      - ../flynkle-auth/app:/app/app 
+    env_file:
+      - ./.env_auth 
+    depends_on:
+      postgres: 
+        condition: service_healthy 
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/auth/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks: 
+      - flynkle_default_network 
+    # --- NEW: Add DNS settings ---
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+
+  # --- Database & Other Services ---
+  postgres:
+    image: postgres:14 # You have 14, I previously suggested 15. Sticking to your 14.
+    container_name: flynkle-postgres-db
+    ports:
+      - "5433:5432" 
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-flynkle} 
+      POSTGRES_USER: ${POSTGRES_USER:-flynkle}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-flynkle}
+      # For flynkle_auth specific DB (optional, but good practice)
+      # Add FLYNKLE_AUTH_DB: ${FLYNKLE_AUTH_DB:-flynkle_auth} here if you want auth to use a separate DB
+      # If using a separate DB, flynkle_auth's DATABASE_URL will point to it.
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck: 
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-flynkle} -d $${POSTGRES_DB:-flynkle}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  vectorstore: # Qdrant
+    image: qdrant/qdrant:latest
+    container_name: flynkle-qdrant-db
+    ports:
+      - "6335:6333" 
+      - "6334:6334" 
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: always
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  minio:
+    image: minio/minio:RELEASE.2023-09-04T19-57-37Z 
+    container_name: flynkle-minio-storage
+    ports:
+      - "9000:9000"
+      - "9002:9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-admin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-password123}
+      MINIO_VOLUMES: "/data"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    restart: always
+    healthcheck: 
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  redis:
+    image: redis:7-alpine
+    container_name: flynkle-redis-container 
+    ports:
+      - "6380:6379" 
+    volumes:
+      - redis_data:/data
+    restart: always
+    healthcheck: 
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+
+  neo4j:
+    image: neo4j:5-community 
+    container_name: flynkle-neo4j-container 
+    ports:
+      - "7474:7474" 
+      - "7687:7687" 
+    volumes:
+      - neo4j_data:/data
+      - ../neo4j/logs:/logs 
+    environment:
+      NEO4J_AUTH: ${NEO4J_AUTH:-none} 
+    restart: always
+    healthcheck: 
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:7474/ || exit 1"] 
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks: # ADD THIS
+      - flynkle_default_network # ADD THIS
+    
+volumes:
+  postgres_data:
+  qdrant_data:
+  minio_data:
+  redis_data:
+  neo4j_data:
+
+networks: # ADD THIS SECTION AT THE END
+  flynkle_default_network: # ADD THIS
+    driver: bridge # ADD THIS
